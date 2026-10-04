@@ -51,7 +51,7 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, uint32_t seed = 0) {
     if (ggml_is_empty(tensor)) {
         return;
     }
@@ -64,9 +64,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
         auto init_thread = [&](size_t start, size_t end) {
             thread_local std::default_random_engine gen(std::random_device{}());
+            std::default_random_engine seeded_gen(seed + uint32_t(start));
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
-                data[i] = distribution(gen);
+                data[i] = seed ? distribution(seeded_gen) : distribution(gen);
             }
         };
 
@@ -148,7 +149,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 }
 
 // generate an F16 mask where certain blocks are randomly masked with -INF value
-static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, int64_t causal_queries = 0) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
 
     GGML_TENSOR_LOCALS( int32_t, ne, tensor, ne);
@@ -157,7 +158,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
     std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(causal_queries ? 0xBADC0DEu : rd());
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
@@ -172,18 +173,27 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (gen() % ne3);
+        const int p2 = (gen() % ne2);
+        const int p1 = (gen() % ne1);
+        const int p0 = (gen() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = gen() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
 
             for (int i0 = 0; i0 < blck0 && p0 + i0 < ne0; i0++) {
                 data_f32[idx + i0] = inf ? -INFINITY : 0.0f;
+            }
+        }
+    }
+
+    if (causal_queries > 0) {
+        GGML_ASSERT(ne1 == causal_queries && ne2 == 1 && ne3 == 1);
+        for (int64_t j = 0; j < ne1; ++j) {
+            for (int64_t i = ne0/2 + j + 1; i < ne0; ++i) {
+                data_f32[j*ne0 + i] = -INFINITY;
             }
         }
     }
@@ -7884,9 +7894,11 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const bool causal_half_context;
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max)
+            + ",causal_half_context=" + (causal_half_context ? "1" : "0");
     }
 
     double max_nmse_err() override {
@@ -7903,9 +7915,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool causal_half_context = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
+          causal_half_context(causal_half_context) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7981,10 +7994,15 @@ struct test_flash_attn_ext : public test_case {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
                 } else {
-                    init_tensor_kq_mask(t);
+                    init_tensor_kq_mask(t, -1.0f, 1.0f, causal_half_context ? nb : 0);
                 }
             } else {
-                init_tensor_uniform(t);
+                uint32_t seed = 0;
+                if (causal_half_context) {
+                    seed = 0xC0FFEEu;
+                    for (const char * p = t->name; *p; ++p) seed = seed*33u + uint8_t(*p);
+                }
+                init_tensor_uniform(t, -1.0f, 1.0f, seed);
             }
         }
     }
@@ -10987,6 +11005,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // Exercise GQA K/V sharing on pre-Ada CUDA with more than one KV tile.
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int nb : {1, 2, 3, 9, 17}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true,
+                                                            false, 0, true));
+        }
+        for (int64_t kv : {1024, 4096, 16384, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0,
+                                                            GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true,
+                                                            false, 0, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4352, 64, true, false, 0, 0,
+                                                        GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true,
+                                                        false, 0, true));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 65, true, false, 0, 0,
+                                                        GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true,
+                                                        false, 0, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 8192, 2, true, false, 0, 0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                                                    {0, 1, 2, 3}, true, false, 0, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 2, true, false, 0, 30,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                    {0, 1, 2, 3}, true, false, 0, true));
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -11507,6 +11550,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
 
     // q8_0 KV cases with long context (decode and prompt)
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 1, true, false, 0, 0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 2, true, false, 0, 0,
+                                                        GGML_PREC_F32, type_KV, type_KV));
+        for (int64_t kv : {4096, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0,
+                                                            GGML_PREC_F32, type_KV, type_KV));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4352, 64, true, false, 0, 0,
+                                                        GGML_PREC_F32, type_KV, type_KV));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   128, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));

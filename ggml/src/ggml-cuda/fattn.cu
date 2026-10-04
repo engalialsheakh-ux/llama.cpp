@@ -5,6 +5,12 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
@@ -521,6 +527,77 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
+struct ggml_cuda_fa_telemetry {
+    std::once_flag device_once;
+    char device_name[256] = {};
+    int cc = 0;
+    ggml_type type_k = GGML_TYPE_COUNT;
+    ggml_type type_v = GGML_TYPE_COUNT;
+    int64_t head_dim = 0;
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> mma_calls{0};
+    std::atomic<uint64_t> mma_quant_direct_calls{0};
+    std::atomic<uint64_t> mma_quant_direct_decode_calls{0};
+    std::atomic<uint64_t> mma_quant_direct_prefill_calls{0};
+    std::atomic<uint64_t> vector_calls{0};
+    std::atomic<uint64_t> vector_gqa_calls{0};
+    std::atomic<uint64_t> tile_calls{0};
+    std::atomic<uint64_t> quant_decode_vector_calls{0};
+    std::atomic<uint64_t> f16_k_calls{0};
+    std::atomic<uint64_t> f16_v_calls{0};
+    std::atomic<int64_t> max_n_q{0};
+    std::atomic<int64_t> max_n_kv{0};
+    std::atomic<uint64_t> max_f16_scratch_bytes{0};
+    std::atomic<uint64_t> max_f16_scratch_used_bytes{0};
+    std::atomic<uint64_t> f16_dequant_bytes{0};
+
+    ~ggml_cuda_fa_telemetry() {
+        const char * enabled = std::getenv("GGML_CUDA_FA_TELEMETRY");
+        if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
+            return;
+        }
+        const bool observed = calls.load(std::memory_order_relaxed) != 0;
+        std::fprintf(stderr,
+            "bmoe-cuda-fa: device=\"%s\" cc=%d K=%s V=%s D=%lld max_n_q=%lld max_n_kv=%lld "
+            "calls=%llu vector=%llu vector_gqa=%llu quant_decode_vector=%llu mma_legacy=%llu tile=%llu mma_quant_direct=%llu "
+            "mma_quant_direct_decode=%llu mma_quant_direct_prefill=%llu "
+            "f16_K_calls=%llu f16_V_calls=%llu max_f16_scratch_bytes=%llu "
+            "max_f16_scratch_used_bytes=%llu f16_dequant_bytes=%llu\n",
+            observed ? device_name : "none", cc, observed ? ggml_type_name(type_k) : "none",
+            observed ? ggml_type_name(type_v) : "none", (long long) head_dim,
+            (long long) max_n_q.load(), (long long) max_n_kv.load(),
+            (unsigned long long) calls.load(), (unsigned long long) vector_calls.load(),
+            (unsigned long long) vector_gqa_calls.load(),
+            (unsigned long long) quant_decode_vector_calls.load(), (unsigned long long) mma_calls.load(),
+            (unsigned long long) tile_calls.load(), (unsigned long long) mma_quant_direct_calls.load(),
+            (unsigned long long) mma_quant_direct_decode_calls.load(),
+            (unsigned long long) mma_quant_direct_prefill_calls.load(),
+            (unsigned long long) f16_k_calls.load(),
+            (unsigned long long) f16_v_calls.load(), (unsigned long long) max_f16_scratch_bytes.load(),
+            (unsigned long long) max_f16_scratch_used_bytes.load(), (unsigned long long) f16_dequant_bytes.load());
+    }
+};
+
+static ggml_cuda_fa_telemetry ggml_cuda_fa_global_telemetry;
+
+template <typename T>
+static void ggml_cuda_fa_atomic_max(std::atomic<T> & value, T next) {
+    T current = value.load(std::memory_order_relaxed);
+    while (current < next && !value.compare_exchange_weak(current, next, std::memory_order_relaxed)) {}
+}
+
+static bool ggml_cuda_fa_telemetry_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_FA_TELEMETRY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static ggml_cuda_fa_telemetry & ggml_cuda_fa_telemetry_state() {
+    return ggml_cuda_fa_global_telemetry;
+}
+
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
@@ -652,7 +729,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
+                    // On Ampere D=256/GQA decode, direct MMA beat the quantized vector kernel
+                    // at 4K, 16K, and 64K KV on the target device. Keep shorter decode on vector.
+                    const bool long_ampere_decode = cc >= GGML_CUDA_CC_AMPERE &&
+                        cc < GGML_CUDA_CC_ADA_LOVELACE && K->ne[1] >= 4096;
+                    if (ggml_cuda_fattn_mma_use_quantized(device, dst) &&
+                            (Q->ne[1] >= 2 || ggml_cuda_fattn_mma_quant_mode() == 2 || long_ampere_decode)) {
+                        return BEST_FATTN_KERNEL_MMA_F16;
+                    }
                     if (Q->ne[1] == 1) {
+                        return BEST_FATTN_KERNEL_VEC;
+                    }
+                    if (ggml_cuda_fattn_vec_use_gqa(device, dst)) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }
@@ -733,9 +821,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = !ggml_cuda_fattn_mma_use_quantized(device, dst);
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
@@ -754,7 +845,63 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (ggml_cuda_fa_telemetry_enabled()) {
+        ggml_cuda_fa_telemetry & t = ggml_cuda_fa_telemetry_state();
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        std::call_once(t.device_once, [&] {
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, ctx.device) == cudaSuccess) {
+                std::strncpy(t.device_name, prop.name, sizeof(t.device_name) - 1);
+            }
+            t.cc = ggml_cuda_info().devices[ctx.device].cc;
+            t.type_k = K->type;
+            t.type_v = V->type;
+            t.head_dim = Q->ne[0];
+        });
+        t.calls.fetch_add(1, std::memory_order_relaxed);
+        ggml_cuda_fa_atomic_max(t.max_n_q, Q->ne[1]);
+        ggml_cuda_fa_atomic_max(t.max_n_kv, K->ne[1]);
+        const bool direct_quant = kernel == BEST_FATTN_KERNEL_MMA_F16 &&
+            ggml_cuda_fattn_mma_use_quantized(ctx.device, dst);
+        if (direct_quant) {
+            t.mma_quant_direct_calls.fetch_add(1, std::memory_order_relaxed);
+            if (Q->ne[1] == 1) t.mma_quant_direct_decode_calls.fetch_add(1, std::memory_order_relaxed);
+            else t.mma_quant_direct_prefill_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+        else if (kernel == BEST_FATTN_KERNEL_MMA_F16) t.mma_calls.fetch_add(1, std::memory_order_relaxed);
+        if (kernel == BEST_FATTN_KERNEL_VEC) {
+            t.vector_calls.fetch_add(1, std::memory_order_relaxed);
+            if (ggml_cuda_fattn_vec_use_gqa(ctx.device, dst)) {
+                t.vector_gqa_calls.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (Q->ne[1] == 1 && ggml_is_quantized(K->type) && ggml_is_quantized(V->type)) {
+                t.quant_decode_vector_calls.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (kernel == BEST_FATTN_KERNEL_TILE) t.tile_calls.fetch_add(1, std::memory_order_relaxed);
+
+        bool need_f16_k = kernel == BEST_FATTN_KERNEL_TILE || kernel == BEST_FATTN_KERNEL_MMA_F16;
+        bool need_f16_v = need_f16_k;
+        if (direct_quant) need_f16_k = need_f16_v = false;
+        if (kernel == BEST_FATTN_KERNEL_VEC) {
+            const bool fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
+            need_f16_k = K->type == GGML_TYPE_F32 || fallback;
+            need_f16_v = V->type == GGML_TYPE_F32 || fallback;
+        }
+        const auto extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_k, need_f16_v);
+        if (extra.K) t.f16_k_calls.fetch_add(1, std::memory_order_relaxed);
+        if (extra.V) t.f16_v_calls.fetch_add(1, std::memory_order_relaxed);
+        ggml_cuda_fa_atomic_max(t.max_f16_scratch_bytes,
+            static_cast<uint64_t>(extra.end - (uintptr_t) dst->data - ggml_nbytes(dst)));
+        const uint64_t used_f16_bytes = (extra.K ? ggml_nelements(K)*sizeof(half) : 0) +
+            (extra.V && extra.V != extra.K ? ggml_nelements(V)*sizeof(half) : 0);
+        ggml_cuda_fa_atomic_max(t.max_f16_scratch_used_bytes, used_f16_bytes);
+        t.f16_dequant_bytes.fetch_add(used_f16_bytes, std::memory_order_relaxed);
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
