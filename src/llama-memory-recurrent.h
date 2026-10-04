@@ -177,7 +177,18 @@ public:
 
     int32_t s_copy(int i) const;
 
+    bool enable_layer_replay();
+    bool set_layer_replay_index(size_t index, bool replay);
+
 private:
+    struct LayerSnapshot {
+        uint32_t n_rs = 0;
+        uint32_t head = 0;
+        int32_t rs_z = -1;
+        std::vector<int32_t> copies;
+        bool valid = false;
+    };
+
     const llama_memory_status status;
 
     llama_memory_recurrent * mem;
@@ -185,6 +196,10 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    bool layer_replay_enabled = false;
+    bool layer_replay_active = false;
+    std::vector<LayerSnapshot> layer_snapshots;
 
     //
     // data needed for building the compute graph for the current ubatch:

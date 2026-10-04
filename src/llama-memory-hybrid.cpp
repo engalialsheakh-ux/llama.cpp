@@ -250,6 +250,24 @@ bool llama_memory_hybrid_context::next() {
     return true;
 }
 
+bool llama_memory_hybrid_context::enable_layer_replay() {
+    if (ubatches.empty()) {
+        return false;
+    }
+    return static_cast<llama_kv_cache_context *>(ctx_attn.get())->enable_layer_replay() &&
+           static_cast<llama_memory_recurrent_context *>(ctx_recr.get())->enable_layer_replay();
+}
+
+bool llama_memory_hybrid_context::set_layer_replay_index(size_t index, bool replay) {
+    if (index >= ubatches.size() ||
+        !static_cast<llama_kv_cache_context *>(ctx_attn.get())->set_layer_replay_index(index, replay) ||
+        !static_cast<llama_memory_recurrent_context *>(ctx_recr.get())->set_layer_replay_index(index, replay)) {
+        return false;
+    }
+    i_next = index;
+    return true;
+}
+
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 

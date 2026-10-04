@@ -24,6 +24,7 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+class llama_memory_hybrid_context;
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -140,14 +141,17 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                           int32_t   layer_start = 0,
+                           int32_t   layer_end = -1);
 
     int encode(const llama_batch_ext & batch_inp);
-    int decode(const llama_batch_ext & batch_inp);
+    int decode(const llama_batch_ext & batch_inp, uint32_t tile_tokens = 0);
+    int decode_layer_tiled(llama_memory_hybrid_context * mctx, uint32_t n_tokens, uint32_t n_outputs, uint32_t tile_tokens);
 
     // compat version
     int encode(const llama_batch & batch_inp);
-    int decode(const llama_batch & batch_inp);
+    int decode(const llama_batch & batch_inp, uint32_t tile_tokens = 0);
 
     //
     // state save/load
@@ -340,6 +344,7 @@ private:
 
     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+    bool layer_tile_poisoned = false;
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
 

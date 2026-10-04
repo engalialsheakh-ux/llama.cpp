@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1394,7 +1395,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, int32_t layer_start, int32_t layer_end) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1406,7 +1407,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
+    gparams.layer_start = layer_start;
+    gparams.layer_end = layer_end;
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1467,6 +1470,114 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ret = GGML_STATUS_SUCCESS;
 
     return res;
+}
+
+int llama_context::decode_layer_tiled(llama_memory_hybrid_context * mctx, uint32_t n_tokens, uint32_t n_outputs_all, uint32_t tile_tokens) {
+    const uint32_t n_embd = model.hparams.n_embd;
+    const uint32_t n_vocab = model.vocab.n_tokens();
+    const int n_layer = model.hparams.n_layer();
+    const size_t n_ubatches = mctx->layer_replay_size();
+    if (model.hparams.n_embd_inp() != n_embd || n_ubatches == 0 || tile_tokens % cparams.n_ubatch != 0) {
+        LLAMA_LOG_ERROR("%s: unsupported input shape for layer-tiled prefill\n", __func__);
+        return -1;
+    }
+
+    uint32_t checked_tokens = 0;
+    llama_pos last_pos = -1;
+    for (size_t i = 0; i < n_ubatches; ++i) {
+        if (!mctx->set_layer_replay_index(i, false)) {
+            return -1;
+        }
+        const auto & ubatch = mctx->get_ubatch();
+        if (ubatch.n_tokens == 0 || ubatch.n_tokens > cparams.n_ubatch || ubatch.n_seqs != 1 ||
+            ubatch.n_seqs_unq != 1 || !ubatch.token || !ubatch.pos || ubatch.n_pos != 4) {
+            LLAMA_LOG_ERROR("%s: unsupported microbatch: tokens=%u seqs=%u unique=%u token=%p pos=%p n_pos=%u\n",
+                            __func__, ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seqs_unq,
+                            (void *) ubatch.token, (void *) ubatch.pos, ubatch.n_pos);
+            return -1;
+        }
+        for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
+            if (ubatch.n_seq_id[t] != 1 || ubatch.seq_id[t][0] != 0 ||
+                (last_pos >= 0 && ubatch.pos[t] != last_pos + 1)) {
+                LLAMA_LOG_ERROR("%s: unexpected sequence or position mapping\n", __func__);
+                return -1;
+            }
+            last_pos = ubatch.pos[t];
+        }
+        checked_tokens += ubatch.n_tokens;
+    }
+    if (checked_tokens != n_tokens) {
+        return -1;
+    }
+
+    const uint32_t max_chunks = tile_tokens / cparams.n_ubatch;
+    std::vector<float> activation(size_t(tile_tokens) * n_embd);
+    LLAMA_LOG_INFO("%s: tile=%u, microbatch=%u, activation=%zu bytes, layers=%d\n", __func__,
+                   tile_tokens, cparams.n_ubatch, activation.size() * sizeof(float), n_layer);
+
+    size_t output_offset = 0;
+    for (size_t tile_first = 0; tile_first < n_ubatches; tile_first += max_chunks) {
+        const size_t tile_last = std::min(n_ubatches, tile_first + max_chunks);
+        for (int layer = 0; layer < n_layer; ++layer) {
+            size_t activation_offset = 0;
+            for (size_t i = tile_first; i < tile_last; ++i) {
+                const bool replay = layer != 0;
+                if (!mctx->set_layer_replay_index(i, replay)) {
+                    return -3;
+                }
+                const auto & stored = mctx->get_ubatch();
+                llama_ubatch ubatch = stored;
+                if (replay) {
+                    ubatch.token = nullptr;
+                    ubatch.embd = activation.data() + activation_offset;
+                }
+
+                n_outputs = 0;
+                if (layer == n_layer - 1) {
+                    for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
+                        n_outputs += ubatch.output[t] != 0;
+                    }
+                }
+
+                ggml_status status = GGML_STATUS_SUCCESS;
+                const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DEFAULT, mctx, status, layer, layer + 1);
+                if (!res) {
+                    LLAMA_LOG_ERROR("%s: tile=%zu layer=%d microbatch=%zu failed (%d); context is invalid\n",
+                                    __func__, tile_first / max_chunks, layer, i, status);
+                    return status == GGML_STATUS_ABORTED ? 2 : -3;
+                }
+                synchronize();
+
+                if (layer + 1 < n_layer) {
+                    ggml_tensor * hidden = res->get_embd();
+                    if (!hidden || hidden->type != GGML_TYPE_F32 || hidden->ne[0] != n_embd ||
+                        hidden->ne[1] != ubatch.n_tokens) {
+                        LLAMA_LOG_ERROR("%s: unexpected intermediate activation shape\n", __func__);
+                        return -3;
+                    }
+                    ggml_backend_tensor_get(hidden, activation.data() + activation_offset, 0,
+                                            size_t(ubatch.n_tokens) * n_embd * sizeof(float));
+                } else if (n_outputs) {
+                    ggml_tensor * out = res->get_logits();
+                    if (!out || !logits.data || output_offset + n_outputs > n_outputs_all) {
+                        LLAMA_LOG_ERROR("%s: unexpected final output shape\n", __func__);
+                        return -3;
+                    }
+                    ggml_backend_tensor_get(out, logits.data + output_offset * n_vocab, 0,
+                                            size_t(n_outputs) * n_vocab * sizeof(float));
+                    output_offset += n_outputs;
+                }
+                activation_offset += size_t(ubatch.n_tokens) * n_embd;
+            }
+        }
+    }
+    if (output_offset != n_outputs_all) {
+        LLAMA_LOG_ERROR("%s: final output count mismatch\n", __func__);
+        return -3;
+    }
+    LLAMA_LOG_INFO("%s: committed tiles=%zu microbatches=%zu state_prepares=%zu layer_graphs=%zu\n", __func__,
+                   (n_ubatches + max_chunks - 1) / max_chunks, n_ubatches, n_ubatches, n_ubatches * size_t(n_layer));
+    return 0;
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
@@ -1708,7 +1819,19 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch_ext & batch_inp) {
+int llama_context::decode(const llama_batch_ext & batch_inp, uint32_t tile_tokens) {
+    if (layer_tile_poisoned) {
+        LLAMA_LOG_ERROR("%s: context is invalid after a failed layer-tiled transaction\n", __func__);
+        return -3;
+    }
+
+    if (tile_tokens && (model.arch != LLM_ARCH_QWEN35MOE || cparams.n_ubatch != 64 ||
+                        cparams.n_rs_seq != 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+                        !cparams.causal_attn || cparams.embeddings || cparams.embeddings_nextn ||
+                        !sampling.samplers.empty() || tile_tokens != 512)) {
+        LLAMA_LOG_ERROR("%s: layer-tiled prefill requires Qwen3.5 MoE, 64-token ubatches, 512-token tiles, causal inference and no backend sampler or recurrent rollback\n", __func__);
+        return -1;
+    }
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1862,6 +1985,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    if (tile_tokens) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid_context *>(mctx.get());
+        if (!hybrid || !hybrid->enable_layer_replay()) {
+            LLAMA_LOG_ERROR("%s: layer-tiled prefill requires a hybrid memory context\n", __func__);
+            return -1;
+        }
+        layer_tile_poisoned = true;
+        const int result = decode_layer_tiled(hybrid, n_tokens_all, n_outputs_all, tile_tokens);
+        if (result != 0) {
+            return result;
+        }
+        layer_tile_poisoned = false;
+    } else {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
@@ -2041,6 +2177,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -4328,9 +4465,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
     return encode(*compat.batch_ext);
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
+int llama_context::decode(const llama_batch & batch_inp, uint32_t tile_tokens) {
     llama_batch_compat compat(this, batch_inp);
-    return decode(*compat.batch_ext);
+    return decode(*compat.batch_ext, tile_tokens);
 }
 
 ///
@@ -4354,6 +4491,17 @@ int32_t llama_decode(
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 
+    return ret;
+}
+
+int32_t llama_decode_layer_tiled(
+        llama_context * ctx,
+          llama_batch   batch,
+             uint32_t   tile_tokens) {
+    const int ret = ctx->decode(batch, tile_tokens);
+    if (ret != 0) {
+        LLAMA_LOG_ERROR("%s: failed to decode tiled prefill, ret = %d\n", __func__, ret);
+    }
     return ret;
 }
 

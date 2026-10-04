@@ -2711,11 +2711,40 @@ bool llama_kv_cache_context::next() {
         return false;
     }
 
+    if (layer_replay_active) {
+        n_kv = layer_n_kv[i_cur];
+    }
+
+    return true;
+}
+
+bool llama_kv_cache_context::enable_layer_replay() {
+    if (ubatches.empty() || layer_replay_enabled) {
+        return false;
+    }
+    layer_n_kv.assign(ubatches.size(), 0);
+    layer_replay_enabled = true;
+    return true;
+}
+
+bool llama_kv_cache_context::set_layer_replay_index(size_t index, bool replay) {
+    if (!layer_replay_enabled || index >= ubatches.size() || (replay && layer_n_kv[index] == 0)) {
+        return false;
+    }
+    i_cur = index;
+    layer_replay_active = replay;
+    if (replay) {
+        n_kv = layer_n_kv[index];
+    }
     return true;
 }
 
 bool llama_kv_cache_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+
+    if (layer_replay_active) {
+        return true;
+    }
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
@@ -2726,6 +2755,9 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    if (layer_replay_enabled) {
+        layer_n_kv[i_cur] = n_kv;
+    }
 
     return true;
 }

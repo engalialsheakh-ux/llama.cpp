@@ -1004,6 +1004,11 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    LLAMA_API int32_t llama_decode_layer_tiled(
+            struct llama_context * ctx,
+              struct llama_batch   batch,
+                    uint32_t       tile_tokens);
+
     //
     // Extended batch API
     //

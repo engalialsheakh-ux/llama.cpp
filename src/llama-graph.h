@@ -813,6 +813,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // Internal layer-tile graph range. The ordinary graph spans every layer.
+    int32_t layer_start = 0;
+    int32_t layer_end = -1;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -881,6 +885,8 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             cparams.expert_cache_layers     == other.cparams.expert_cache_layers     &&
             cparams.expert_cache_layer_count == other.cparams.expert_cache_layer_count &&
+            layer_start == other.layer_start &&
+            layer_end == other.layer_end &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1361,7 +1367,7 @@ struct llm_graph_context {
     // hybrid
     //
 
-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool need_attn = true, bool need_recr = true) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;

@@ -156,6 +156,10 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35moe::build_arch_graph(const
 llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int layer_start = params.layer_start;
+    const int layer_end = params.layer_end < 0 ? n_layer : params.layer_end;
+
+    GGML_ASSERT(layer_start >= 0 && layer_start < layer_end && layer_end <= n_layer);
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -169,13 +173,19 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
     cb(inpL, "model.input_embed", -1);
 
-    auto * inp = build_inp_mem_hybrid();
+    bool need_attn = false;
+    bool need_recr = false;
+    for (int il = layer_start; il < layer_end; ++il) {
+        need_recr |= hparams.is_recr(il);
+        need_attn |= !hparams.is_recr(il);
+    }
+    auto * inp = build_inp_mem_hybrid(need_attn, need_recr);
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos     = need_attn ? build_inp_pos() : nullptr;
+    ggml_tensor * inp_out_ids = layer_end == n_layer ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -225,6 +235,12 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         inpL = cur;
     }
     cur = inpL;
+
+    if (layer_end < n_layer) {
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // post-norm hidden state feeds both the LM head and the MTP seed below
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

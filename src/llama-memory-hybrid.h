@@ -127,6 +127,10 @@ public:
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
 
+    bool enable_layer_replay();
+    bool set_layer_replay_index(size_t index, bool replay);
+    size_t layer_replay_size() const { return ubatches.size(); }
+
 private:
     // the index of the next ubatch to process
     size_t i_next = 0;

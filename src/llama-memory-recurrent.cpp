@@ -1249,8 +1249,30 @@ bool llama_memory_recurrent_context::next() {
     return true;
 }
 
+bool llama_memory_recurrent_context::enable_layer_replay() {
+    if (ubatches.empty() || layer_replay_enabled || mem->n_rs_seq != 0) {
+        return false;
+    }
+    layer_snapshots.resize(ubatches.size());
+    layer_replay_enabled = true;
+    return true;
+}
+
+bool llama_memory_recurrent_context::set_layer_replay_index(size_t index, bool replay) {
+    if (!layer_replay_enabled || index >= ubatches.size() || (replay && !layer_snapshots[index].valid)) {
+        return false;
+    }
+    i_next = index;
+    layer_replay_active = replay;
+    return true;
+}
+
 bool llama_memory_recurrent_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+
+    if (layer_replay_active) {
+        return true;
+    }
 
     // no ubatches -> this is an update
     if (ubatches.empty()) {
@@ -1260,7 +1282,21 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    const bool slot_ok = mem->find_slot(ubatches[i_next]);
+    if (layer_replay_enabled && !slot_ok) {
+        return false;
+    }
+    if (layer_replay_enabled) {
+        auto & snapshot = layer_snapshots[i_next];
+        snapshot.n_rs = mem->n;
+        snapshot.head = mem->head;
+        snapshot.rs_z = mem->rs_z;
+        snapshot.copies.resize(snapshot.n_rs);
+        for (uint32_t i = 0; i < snapshot.n_rs; ++i) {
+            snapshot.copies[i] = s_copy(i);
+        }
+        snapshot.valid = true;
+    }
 
     return true;
 }
@@ -1276,15 +1312,15 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
-    return is_full ? mem->size : mem->n;
+    return is_full ? mem->size : layer_replay_active ? layer_snapshots[i_next].n_rs : mem->n;
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {
-    return is_full ? 0 : mem->head;
+    return is_full ? 0 : layer_replay_active ? layer_snapshots[i_next].head : mem->head;
 }
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
-    return is_full ? 0 : mem->rs_z;
+    return is_full ? 0 : layer_replay_active ? layer_snapshots[i_next].rs_z : mem->rs_z;
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {
@@ -1304,6 +1340,11 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
+    if (layer_replay_active) {
+        const auto & copies = layer_snapshots[i_next].copies;
+        GGML_ASSERT(i >= 0 && (size_t) i < copies.size());
+        return copies[(size_t) i];
+    }
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 

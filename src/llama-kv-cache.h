@@ -391,6 +391,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    bool enable_layer_replay();
+    bool set_layer_replay_index(size_t index, bool replay);
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -461,4 +464,8 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    bool layer_replay_enabled = false;
+    bool layer_replay_active = false;
+    std::vector<uint32_t> layer_n_kv;
 };
