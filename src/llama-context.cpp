@@ -1828,8 +1828,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp, uint32_t tile_token
     if (tile_tokens && (model.arch != LLM_ARCH_QWEN35MOE || cparams.n_ubatch != 64 ||
                         cparams.n_rs_seq != 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
                         !cparams.causal_attn || cparams.embeddings || cparams.embeddings_nextn ||
-                        !sampling.samplers.empty() || tile_tokens != 512)) {
-        LLAMA_LOG_ERROR("%s: layer-tiled prefill requires Qwen3.5 MoE, 64-token ubatches, 512-token tiles, causal inference and no backend sampler or recurrent rollback\n", __func__);
+                        !sampling.samplers.empty() || tile_tokens < 512 || tile_tokens > 8192 ||
+                        (tile_tokens & (tile_tokens - 1)) != 0)) {
+        LLAMA_LOG_ERROR("%s: layer-tiled prefill requires Qwen3.5 MoE, 64-token ubatches, power-of-two tiles from 512 to 8192, causal inference and no backend sampler or recurrent rollback\n", __func__);
         return -1;
     }
     if (!memory) {
