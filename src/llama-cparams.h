@@ -64,4 +64,6 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+    const llama_expert_cache_layer * expert_cache_layers = nullptr;
+    size_t expert_cache_layer_count = 0;
 };

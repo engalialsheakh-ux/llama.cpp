@@ -2163,7 +2163,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // The external cache branch is opt-in and currently covers exact single-token
+    // split gate/up/down with SiLU. Prefill and every unsupported graph keep the
+    // original expert path.
+    const llama_expert_cache_layer * expert_cache = nullptr;
+    ggml_tensor * cache_ids = nullptr;
+    if (n_tokens == 1 && il >= 0 && cparams.expert_cache_layers &&
+        size_t(il) < cparams.expert_cache_layer_count && gate_exps && up_exps && down_exps && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
+        expert_cache = &cparams.expert_cache_layers[il];
+        if (!expert_cache->up || !expert_cache->gate || !expert_cache->down ||
+            !expert_cache->host_table || !expert_cache->device_table) {
+            expert_cache = nullptr;
+        }
+    }
+    if (expert_cache) {
+        cache_ids = ggml_get_rows(ctx0, expert_cache->device_table, selected_experts);
+        cache_ids = ggml_reshape_2d(ctx0, cache_ids, n_expert_used, 1);
+        cb(cache_ids, "ffn_moe_cache_slots", il);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * cache_input = cur;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2198,6 +2220,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
+        if (expert_cache) {
+            up->src[3] = expert_cache->host_table;
+            std::memcpy(up->op_params, &expert_cache->dummy_slot, sizeof(expert_cache->dummy_slot));
+        }
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
@@ -2211,6 +2237,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+            if (expert_cache) {
+                cur->src[3] = expert_cache->host_table;
+                std::memcpy(cur->op_params, &expert_cache->dummy_slot, sizeof(expert_cache->dummy_slot));
+            }
         } else {
             cur = up;
         }
@@ -2311,11 +2341,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    if (expert_cache) {
+        experts->src[3] = expert_cache->host_table;
+        std::memcpy(experts->op_params, &expert_cache->dummy_slot, sizeof(expert_cache->dummy_slot));
+    }
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
     }
     cb(experts, "ffn_moe_down", il);
+
+    if (expert_cache) {
+        ggml_tensor * up_gpu = ggml_mul_mat_id(ctx0, expert_cache->up, cache_input, cache_ids);
+        ggml_tensor * gate_gpu = ggml_mul_mat_id(ctx0, expert_cache->gate, cache_input, cache_ids);
+        ggml_tensor * activated_gpu = nullptr;
+        const float limit = hparams.swiglu_clamp_exp[il];
+        if (limit > 1e-6f) {
+            up_gpu = ggml_clamp(ctx0, up_gpu, -limit, limit);
+            ggml_tensor * gated_gpu = ggml_silu(ctx0, gate_gpu);
+            gated_gpu = ggml_clamp(ctx0, gated_gpu, -INFINITY, limit);
+            activated_gpu = ggml_mul(ctx0, gated_gpu, up_gpu);
+        } else {
+            activated_gpu = ggml_swiglu_split(ctx0, gate_gpu, up_gpu);
+        }
+        ggml_tensor * down_gpu = ggml_mul_mat_id(ctx0, expert_cache->down, activated_gpu, cache_ids);
+        experts = ggml_add(ctx0, experts, down_gpu);
+        cb(experts, "ffn_moe_cache_merged", il);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);

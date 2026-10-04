@@ -119,6 +119,7 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_expert_cache_layers(const llama_expert_cache_layer * layers, size_t count);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 

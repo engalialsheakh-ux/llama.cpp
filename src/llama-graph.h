@@ -879,6 +879,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.expert_cache_layers     == other.cparams.expert_cache_layers     &&
+            cparams.expert_cache_layer_count == other.cparams.expert_cache_layer_count &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

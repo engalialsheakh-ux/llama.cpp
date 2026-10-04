@@ -1272,6 +1272,12 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_expert_cache_layers(const llama_expert_cache_layer * layers, size_t count) {
+    cparams.expert_cache_layers = layers;
+    cparams.expert_cache_layer_count = count;
+    sched_need_reserve = true;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -3924,6 +3930,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_expert_cache_layers(llama_context * ctx, const llama_expert_cache_layer * layers, size_t count) {
+    ctx->set_expert_cache_layers(layers, count);
 }
 
 void llama_synchronize(llama_context * ctx) {

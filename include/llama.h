@@ -1108,6 +1108,21 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Optional external expert slots for the decode-only split gate/up/down MoE graph.
+    // The caller owns every tensor and keeps them alive until the context is freed.
+    struct llama_expert_cache_layer {
+        struct ggml_tensor * up;
+        struct ggml_tensor * gate;
+        struct ggml_tensor * down;
+        struct ggml_tensor * host_table;
+        struct ggml_tensor * device_table;
+        int32_t dummy_slot;
+    };
+
+    LLAMA_API void llama_set_expert_cache_layers(struct llama_context * ctx,
+                                                const struct llama_expert_cache_layer * layers,
+                                                size_t count);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //

@@ -1652,12 +1652,29 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // An opt-in host expert->GPU-slot table makes a routed GPU hit contribute
+        // only through the device branch. The zeroed CPU row still participates
+        // in the ordinary weighted sum, while the expert-ready hook sees misses.
+        const struct ggml_tensor * cache_map = dst->src[3];
+        const int32_t * cache_slots = NULL;
+        int32_t cache_dummy = 0;
+        if (cache_map) {
+            GGML_ASSERT(cache_map->type == GGML_TYPE_I32 && cache_map->ne[0] >= n_as && cache_map->data);
+            cache_slots = (const int32_t *) cache_map->data;
+            cache_dummy = ggml_get_op_params_i32(dst, 0);
+        }
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
+
+                if (cache_slots && cache_slots[i02] != cache_dummy) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
