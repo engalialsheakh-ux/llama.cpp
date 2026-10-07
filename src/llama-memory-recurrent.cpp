@@ -1250,7 +1250,9 @@ bool llama_memory_recurrent_context::next() {
 }
 
 bool llama_memory_recurrent_context::enable_layer_replay() {
-    if (ubatches.empty() || layer_replay_enabled || mem->n_rs_seq != 0) {
+    // Replaying a prefill is safe while no speculative rollback slot is active.
+    if (ubatches.empty() || layer_replay_enabled ||
+        std::any_of(mem->rs_idx.begin(), mem->rs_idx.end(), [](uint32_t idx) { return idx != 0; })) {
         return false;
     }
     layer_snapshots.resize(ubatches.size());

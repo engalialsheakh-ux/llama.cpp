@@ -84,6 +84,7 @@ static void dummy_backend_buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor *
 static void dummy_backend_buffer_get_tensor(ggml_backend_buffer_t, const ggml_tensor *, void *, size_t, size_t) {}
 
 static void dummy_backend_buffer_clear(ggml_backend_buffer_t, uint8_t) {}
+static void dummy_backend_buffer_reset(ggml_backend_buffer_t) {}
 
 // ggml_backend_device interface
 
@@ -145,6 +146,12 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     return b;
 }
 
+static ggml_backend_sched_ptr dummy_backend_sched_new(dummy_backend & b) {
+    ggml_backend_t backends[] = { &b.context->backend };
+    ggml_backend_buffer_type_t bufts[] = { &b.buffer_type };
+    return ggml_backend_sched_ptr(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+}
+
 //
 // test utilities
 
@@ -174,6 +181,13 @@ static ggml_tensor * make_input_1d(ggml_context * ctx, int64_t n_elements) {
 static ggml_tensor * make_input_with_size(ggml_context * ctx, size_t size_bytes) {
     GGML_ASSERT(size_bytes % 4 == 0);
     return make_input_1d(ctx, size_bytes / 4);
+}
+
+static ggml_tensor * make_scale_graph(ggml_context * ctx, ggml_cgraph * graph, size_t size_bytes) {
+    ggml_tensor * out = ggml_scale(ctx, make_input_with_size(ctx, size_bytes), 2.0f);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+    return out;
 }
 
 static void assign_names(ggml_context * ctx, const char * prefix = "x") {
@@ -615,6 +629,59 @@ static void test_reallocation() {
     }
 }
 
+static void test_shared_buffers() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    auto [ctx_src, graph_src, ctx_src_ptr] = make_context();
+    ggml_tensor * src_out = make_scale_graph(ctx_src, graph_src, 16);
+    ggml_backend_sched_ptr src = dummy_backend_sched_new(backend);
+    GGML_ASSERT(ggml_backend_sched_reserve(src.get(), graph_src));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(src.get(), graph_src));
+    const size_t shared_size = backend.context->allocated_total();
+    GGML_ASSERT(shared_size > 0);
+
+    auto [ctx_dst, graph_dst, ctx_dst_ptr] = make_context();
+    ggml_tensor * dst_out = make_scale_graph(ctx_dst, graph_dst, 8);
+    ggml_backend_sched_ptr dst = dummy_backend_sched_new(backend);
+    GGML_ASSERT(ggml_backend_sched_share_compute_buffers(dst.get(), src.get()));
+    GGML_ASSERT(ggml_backend_sched_reserve(dst.get(), graph_dst));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(dst.get(), graph_dst));
+    GGML_ASSERT(backend.context->allocated_total() == shared_size);
+    GGML_ASSERT(src_out->buffer == dst_out->buffer);
+
+    ggml_backend_sched_reset(src.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(src.get(), graph_src));
+
+    auto [ctx_big, graph_big, ctx_big_ptr] = make_context();
+    ggml_tensor * big_out = make_scale_graph(ctx_big, graph_big, 64);
+    ggml_backend_sched_ptr big = dummy_backend_sched_new(backend);
+    GGML_ASSERT(ggml_backend_sched_share_compute_buffers(big.get(), src.get()));
+    GGML_ASSERT(ggml_backend_sched_reserve(big.get(), graph_big));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(big.get(), graph_big));
+    GGML_ASSERT(big_out->buffer != src_out->buffer);
+    GGML_ASSERT(backend.context->allocated_total() > shared_size);
+
+    big.reset();
+    GGML_ASSERT(backend.context->allocated_total() == shared_size);
+    src.reset();
+    GGML_ASSERT(backend.context->allocated_total() == shared_size);
+    ggml_backend_sched_reset(dst.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(dst.get(), graph_dst));
+    dst.reset();
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+}
+
+static void test_shared_buffers_reset_rejected() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    backend.context->buffer_interface.reset = dummy_backend_buffer_reset;
+    auto [ctx_src, graph_src, ctx_src_ptr] = make_context();
+    make_scale_graph(ctx_src, graph_src, 16);
+    ggml_backend_sched_ptr src = dummy_backend_sched_new(backend);
+    GGML_ASSERT(ggml_backend_sched_reserve(src.get(), graph_src));
+
+    ggml_backend_sched_ptr dst = dummy_backend_sched_new(backend);
+    GGML_ASSERT(!ggml_backend_sched_share_compute_buffers(dst.get(), src.get()));
+}
+
 static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -671,6 +738,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_shared_buffers", test_shared_buffers);
+    run("test_shared_buffers_reset_rejected", test_shared_buffers_reset_rejected);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;
 }

@@ -90,6 +90,12 @@ extern "C" {
     GGML_API void                  ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API void                  ggml_backend_meta_buffer_set_usage (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
 
+    struct ggml_gallocr;
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((visibility("hidden")))
+#endif
+    bool ggml_gallocr_share_buffers(struct ggml_gallocr * dst, struct ggml_gallocr * src);
+
     //
     // Backend (meta)
     //

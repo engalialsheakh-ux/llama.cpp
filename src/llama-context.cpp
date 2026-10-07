@@ -144,6 +144,12 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
+    if (params.ctx_other_share_compute && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
+        &params.ctx_other->get_model() == &model && cparams.n_seq_max == 1 && params.ctx_other->n_seq_max() == 1) {
+        ctx_compute = params.ctx_other->compute_state;
+        params.ctx_other->compute_share_source = true;
+    }
+
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
@@ -303,6 +309,11 @@ llama_context::llama_context(
             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
             LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
         }
+    }
+
+    cparams.n_kv = params.n_kv == 0 ? cparams.n_ctx_seq : params.n_kv;
+    if (cparams.n_kv > cparams.n_ctx_seq || cparams.n_kv == 0 || cparams.n_kv % 256 != 0) {
+        throw std::runtime_error("n_kv must be a positive multiple of 256 no larger than n_ctx_seq");
     }
 
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
@@ -481,6 +492,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    compute_state.reset();
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -616,6 +628,10 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 void llama_context::sched_reserve() {
+    auto source = ctx_compute.lock();
+    if (source && compute_generation != source->generation) {
+        sched_need_reserve = true;
+    }
     if (!sched_need_reserve) {
         return;
     }
@@ -641,7 +657,32 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
+    auto previous_sched = std::move(sched);
+    compute_state->sched = nullptr;
+    if (!compute_share_source) {
+        previous_sched.reset();
+    }
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    if (source) {
+        int n_devices = 0;
+        for (ggml_backend_t backend : backend_ptrs) {
+            ggml_backend_dev_t device = ggml_backend_get_device(backend);
+            if (device != nullptr && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                ++n_devices;
+            }
+        }
+        if (n_devices == 1 && ggml_backend_sched_share_compute_buffers(sched.get(), source->sched)) {
+            LLAMA_LOG_INFO("%s: sharing compute buffers with the target context\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: compute buffer sharing unavailable; using independent buffers\n", __func__);
+        }
+        compute_generation = source->generation;
+    } else if (compute_share_source && previous_sched) {
+        ggml_backend_sched_share_compute_buffers(sched.get(), previous_sched.get());
+    }
+    previous_sched.reset();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -741,6 +782,9 @@ void llama_context::sched_reserve() {
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
     }
+
+    compute_state->sched = sched.get();
+    ++compute_state->generation;
 
     {
         const bool diff = n_nodes_pp != n_nodes_tg || n_splits_pp != n_splits_tg ||
@@ -1516,6 +1560,7 @@ int llama_context::decode_layer_tiled(llama_memory_hybrid_context * mctx, uint32
                    tile_tokens, cparams.n_ubatch, activation.size() * sizeof(float), n_layer);
 
     size_t output_offset = 0;
+    size_t nextn_offset = 0;
     for (size_t tile_first = 0; tile_first < n_ubatches; tile_first += max_chunks) {
         const size_t tile_last = std::min(n_ubatches, tile_first + max_chunks);
         for (int layer = 0; layer < n_layer; ++layer) {
@@ -1567,11 +1612,25 @@ int llama_context::decode_layer_tiled(llama_memory_hybrid_context * mctx, uint32
                                             size_t(n_outputs) * n_vocab * sizeof(float));
                     output_offset += n_outputs;
                 }
+                if (layer == n_layer - 1 && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+                    ggml_tensor * nextn = res->get_h_nextn();
+                    const size_t rows = ubatch.n_tokens;
+                    if (!nextn || !embd_nextn.data || nextn->type != GGML_TYPE_F32 ||
+                        nextn->ne[0] != n_embd || nextn->ne[1] != (int64_t) rows ||
+                        (nextn_offset + rows) * n_embd > embd_nextn.size) {
+                        LLAMA_LOG_ERROR("%s: unexpected nextn output shape\n", __func__);
+                        return -3;
+                    }
+                    ggml_backend_tensor_get(nextn, embd_nextn.data + nextn_offset * n_embd, 0,
+                                            rows * n_embd * sizeof(float));
+                    nextn_offset += rows;
+                }
                 activation_offset += size_t(ubatch.n_tokens) * n_embd;
             }
         }
     }
-    if (output_offset != n_outputs_all) {
+    if (output_offset != n_outputs_all ||
+        (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && nextn_offset != n_tokens)) {
         LLAMA_LOG_ERROR("%s: final output count mismatch\n", __func__);
         return -3;
     }
@@ -1826,11 +1885,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp, uint32_t tile_token
     }
 
     if (tile_tokens && (model.arch != LLM_ARCH_QWEN35MOE || cparams.n_ubatch != 64 ||
-                        cparams.n_rs_seq != 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
-                        !cparams.causal_attn || cparams.embeddings || cparams.embeddings_nextn ||
+                        (cparams.n_rs_seq != 0 && !cparams.embeddings_nextn) ||
+                        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+                        !cparams.causal_attn || cparams.embeddings || cparams.embeddings_nextn_masked ||
                         !sampling.samplers.empty() || tile_tokens < 512 || tile_tokens > 8192 ||
                         (tile_tokens & (tile_tokens - 1)) != 0)) {
-        LLAMA_LOG_ERROR("%s: layer-tiled prefill requires Qwen3.5 MoE, 64-token ubatches, power-of-two tiles from 512 to 8192, causal inference and no backend sampler or recurrent rollback\n", __func__);
+        LLAMA_LOG_ERROR("%s: layer-tiled prefill requires Qwen3.5 MoE, 64-token ubatches, power-of-two tiles from 512 to 8192, causal inference and no backend sampler\n", __func__);
         return -1;
     }
     if (!memory) {
@@ -1976,7 +2036,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, uint32_t tile_token
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -2240,7 +2300,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, uint32_t tile_token
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2270,9 +2330,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
-        // unmasked: nextn row exists for every token in the batch, not just
-        // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        // Unmasked nextn returns a row for every token in this decode batch, even
+        // when only the last token requests logits. Keep the logical batch limit
+        // independent of the physical output allocation.
+        embd_nextn.size = (size_t) n_embd_out * std::max(n_outputs, n_tokens);
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -3722,7 +3783,7 @@ void llama_context::opt_epoch_iter(
         }
 
         // reserve output buffer
-        if (output_reserve(n_outputs_all) < n_outputs_all) {
+        if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
             LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
             GGML_ABORT("TODO: handle this error");
         };
@@ -3840,6 +3901,7 @@ void llama_context::opt_epoch(
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
+        /*.n_kv                        =*/ 0,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
@@ -3876,6 +3938,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.ctx_other_share_compute     =*/ false,
     };
 
     return result;
@@ -4134,6 +4197,26 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+size_t llama_get_kv_cache_size_bytes(const struct llama_context * ctx) {
+    if (!ctx) return 0;
+    auto * memory = ctx->get_memory();
+    const llama_kv_cache * kv = nullptr;
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) kv = hybrid->get_mem_attn();
+    else kv = dynamic_cast<llama_kv_cache *>(memory);
+    if (!kv) return 0;
+    size_t bytes = 0;
+    for (const auto & entry : kv->memory_breakdown()) bytes += entry.second;
+    return bytes;
+}
+
+uint32_t llama_get_kv_cache_capacity(const struct llama_context * ctx) {
+    if (!ctx) return 0;
+    auto * memory = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) return hybrid->get_mem_attn()->get_size();
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) return kv->get_size();
+    return 0;
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
