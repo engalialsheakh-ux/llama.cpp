@@ -601,6 +601,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_LRU_DECIDE,
+        GGML_OP_LRU_STAGE,
+        GGML_OP_LRU_FILL,
+
         GGML_OP_COUNT,
     };
 
@@ -2614,6 +2618,39 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * state);
+
+    // The device keeps cache ownership and recency in state. The result contains
+    // remapped slot IDs followed by (expert, slot) fills and their count.
+    GGML_API struct ggml_tensor * ggml_lru_decide(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * state,
+            int32_t               n_expert,
+            int32_t               n_slot);
+
+    // Stage only device-selected misses into a bounded mapped host buffer.
+    // The callback runs as a CUDA stream host node after the fill list copy.
+    typedef void (*ggml_lru_stage_callback)(void * user_data);
+    struct ggml_lru_stage_params {
+        int32_t * host_fill_list;
+        ggml_lru_stage_callback callback;
+        void * user_data;
+    };
+    GGML_API struct ggml_tensor * ggml_lru_stage(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * fill_list,
+            int32_t             * host_fill_list,
+            ggml_lru_stage_callback callback,
+            void                * user_data);
+
+    // Fill the pool from a device-addressable host staging region indexed by
+    // fill order. The returned view
+    // orders consumers after the fill without allocating another expert bank.
+    GGML_API struct ggml_tensor * ggml_lru_fill(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * fill_list,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * pool);
 
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix
     *  without zeroes on the diagonal (i.e. invertible).

@@ -214,6 +214,18 @@ typedef void * thread_ret_t;
 
 typedef pthread_t ggml_thread_t;
 
+static bool       g_expert_ffn_fusion = false;
+static atomic_int g_expert_ffn_fusion_count = 0;
+
+void ggml_cpu_set_expert_ffn_fusion(bool enabled) {
+    g_expert_ffn_fusion = enabled;
+    atomic_store_explicit(&g_expert_ffn_fusion_count, 0, memory_order_relaxed);
+}
+
+int64_t ggml_cpu_expert_ffn_fusion_count(void) {
+    return atomic_load_explicit(&g_expert_ffn_fusion_count, memory_order_relaxed);
+}
+
 #define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
 #define GGML_THREADPOOL_N_THREADS_BITS (16)
 
@@ -1556,6 +1568,215 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// Keep each streamed expert's projections on one worker so a slow expert does
+// not impose a projection-wide barrier on unrelated ready experts.
+static bool ggml_cpu_expert_ffn_candidate(const struct ggml_cgraph * graph, int node_n) {
+    if (!g_expert_ffn_fusion || node_n + 3 >= graph->n_nodes) {
+        return false;
+    }
+    const struct ggml_tensor * first = graph->nodes[node_n];
+    const struct ggml_tensor * second = graph->nodes[node_n + 1];
+    const struct ggml_tensor * glu = graph->nodes[node_n + 2];
+    const struct ggml_tensor * down = graph->nodes[node_n + 3];
+    if (first->op != GGML_OP_MUL_MAT_ID || second->op != GGML_OP_MUL_MAT_ID ||
+        glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        down->op != GGML_OP_MUL_MAT_ID || down->src[1] != glu ||
+        !((glu->src[0] == first && glu->src[1] == second) ||
+          (glu->src[0] == second && glu->src[1] == first))) {
+        return false;
+    }
+    const struct ggml_tensor * input = first->src[1];
+    const struct ggml_tensor * ids = first->src[2];
+    if (input != second->src[1] || ids != second->src[2] || ids != down->src[2] ||
+        input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || input->ne[3] != 1 ||
+        ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0 || ids->ne[1] <= 0 || ids->ne[1] > 16 ||
+        ids->ne[2] != 1 || ids->ne[3] != 1 || input->ne[2] != ids->ne[1] ||
+        input->ne[1] <= 0 || first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 ||
+        glu->type != GGML_TYPE_F32 || down->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(first, second) || !ggml_are_same_shape(first, glu) ||
+        down->nb[0] != sizeof(float) || down->ne[3] != 1) {
+        return false;
+    }
+    const struct ggml_tensor * projections[] = { first, second, down };
+    const int64_t n_experts = first->src[0]->ne[2];
+    for (int p = 0; p < 3; ++p) {
+        const struct ggml_tensor * op = projections[p];
+        const struct ggml_tensor * weights = op->src[0];
+        const struct ggml_type_traits_cpu * traits = &type_traits_cpu[weights->type];
+        if (!traits->vec_dot || !type_traits_cpu[traits->vec_dot_type].from_float ||
+            weights->ne[0] <= 0 || weights->ne[0] > INT_MAX || weights->ne[1] <= 0 ||
+            weights->ne[1] > INT_MAX || weights->ne[2] != n_experts || n_experts > INT_MAX ||
+            weights->ne[3] != 1 || weights->nb[0] != ggml_type_size(weights->type) ||
+            weights->nb[1] < ggml_row_size(weights->type, weights->ne[0]) ||
+            weights->nb[2] < weights->nb[1]*(size_t) weights->ne[1] ||
+            weights->ne[0] != op->src[1]->ne[0] || op->ne[0] != weights->ne[1] ||
+            op->ne[1] != ids->ne[0] || op->ne[2] != ids->ne[1] || op->ne[3] != 1 ||
+            op->src[3] != first->src[3] ||
+            (op->src[3] && ggml_get_op_params_i32(op, 0) != ggml_get_op_params_i32(first, 0))) {
+            return false;
+        }
+    }
+    if (type_traits_cpu[first->src[0]->type].vec_dot_type !=
+        type_traits_cpu[second->src[0]->type].vec_dot_type) {
+        return false;
+    }
+    if (first->src[3] && (first->src[3]->type != GGML_TYPE_I32 ||
+                         first->src[3]->ne[0] < n_experts || first->src[3]->nb[0] != sizeof(int32_t))) {
+        return false;
+    }
+    const enum ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID };
+    const int outputs[] = { node_n + 3 };
+    return ggml_can_fuse_subgraph(graph, node_n, 4, ops, outputs, 1);
+}
+
+struct ggml_cpu_expert_ffn_shared {
+    int active_count;
+    atomic_int next;
+};
+
+static size_t ggml_cpu_expert_ffn_thread_size(const struct ggml_tensor * first,
+                                            const struct ggml_tensor * down) {
+    const int64_t n_routes = ggml_nelements(first->src[2]);
+    const enum ggml_type qtype = type_traits_cpu[down->src[0]->type].vec_dot_type;
+    // Gate/activation rows plus one reusable up row and one quantized down input.
+    return GGML_PAD((n_routes + 1)*first->ne[0]*sizeof(float), 64) +
+           GGML_PAD(ggml_row_size(qtype, first->ne[0]), 64);
+}
+
+static size_t ggml_cpu_expert_ffn_work_size(const struct ggml_cgraph * graph, int node_n, int nth) {
+    const struct ggml_tensor * first = graph->nodes[node_n];
+    const struct ggml_tensor * input = first->src[1];
+    const struct ggml_tensor * down = graph->nodes[node_n + 3];
+    const enum ggml_type qtype = type_traits_cpu[first->src[0]->type].vec_dot_type;
+    return 64 + GGML_PAD(sizeof(struct ggml_cpu_expert_ffn_shared), 64) +
+           GGML_PAD(ggml_row_size(qtype, ggml_nelements(input)), 64) +
+           GGML_PAD(ggml_nelements(first->src[2])*sizeof(int32_t), 64) +
+           GGML_PAD(first->src[0]->ne[2]*sizeof(int32_t), 64) +
+           nth*ggml_cpu_expert_ffn_thread_size(first, down);
+}
+
+static bool ggml_compute_forward_expert_ffn_fused(const struct ggml_compute_params * params,
+                                                 const struct ggml_tensor * glu,
+                                                 struct ggml_tensor * down) {
+    const struct ggml_tensor * gate = glu->src[0];
+    const struct ggml_tensor * up = glu->src[1];
+    const struct ggml_tensor * input = gate->src[1];
+    const struct ggml_tensor * ids = gate->src[2];
+    const struct ggml_tensor * gate_w = gate->src[0];
+    const struct ggml_tensor * up_w = up->src[0];
+    const struct ggml_tensor * down_w = down->src[0];
+    const int n_experts = gate_w->ne[2];
+    const int n_routes = ggml_nelements(ids);
+    const int n_ff = gate->ne[0];
+    const enum ggml_type input_qtype = type_traits_cpu[gate_w->type].vec_dot_type;
+    const enum ggml_type down_qtype = type_traits_cpu[down_w->type].vec_dot_type;
+    const size_t input_row_size = ggml_row_size(input_qtype, input->ne[0]);
+    void * cursor = params->wdata;
+    struct ggml_cpu_expert_ffn_shared * shared =
+        incr_ptr_aligned(&cursor, GGML_PAD(sizeof(*shared), 64), 64);
+    char * inputs = incr_ptr_aligned(&cursor, GGML_PAD(input_row_size*ggml_nrows(input), 64), 64);
+    int32_t * routes = incr_ptr_aligned(&cursor, GGML_PAD(n_routes*sizeof(int32_t), 64), 64);
+    int32_t * active = incr_ptr_aligned(&cursor, GGML_PAD(n_experts*sizeof(int32_t), 64), 64);
+    const size_t thread_size = ggml_cpu_expert_ffn_thread_size(gate, down);
+    char * threads = incr_ptr_aligned(&cursor, params->nth*thread_size, 64);
+    GGML_ASSERT(params->wsize >= (size_t) ((char *) cursor - (char *) params->wdata));
+
+    // The graph allocator may reuse input/ID storage for the final output. Finish
+    // every read of graph-owned inputs before any worker writes a down result.
+    for (int64_t row = params->ith; row < ggml_nrows(input); row += params->nth) {
+        const int64_t token = row/input->ne[1];
+        const int64_t slot = row%input->ne[1];
+        const float * values = (const float *) ((const char *) input->data + token*input->nb[2] + slot*input->nb[1]);
+        type_traits_cpu[input_qtype].from_float(values, inputs + row*input_row_size, input->ne[0]);
+    }
+    if (params->ith == 0) {
+        const int32_t * map = gate->src[3] ? (const int32_t *) gate->src[3]->data : NULL;
+        const int32_t dummy = ggml_get_op_params_i32(gate, 0);
+        for (int row = 0; row < n_routes; ++row) {
+            const int32_t expert = *(const int32_t *) ((const char *) ids->data +
+                (row/ids->ne[0])*ids->nb[1] + (row%ids->ne[0])*ids->nb[0]);
+            GGML_ASSERT(expert >= 0 && expert < n_experts);
+            routes[row] = map && map[expert] != dummy ? -1 : expert;
+        }
+        shared->active_count = 0;
+        for (int expert = 0; expert < n_experts; ++expert) {
+            for (int row = 0; row < n_routes; ++row) {
+                if (routes[row] == expert) {
+                    active[shared->active_count++] = expert;
+                    break;
+                }
+            }
+        }
+        atomic_store_explicit(&shared->next, 0, memory_order_relaxed);
+    }
+    ggml_barrier(params->threadpool);
+    if (shared->active_count < params->nth || params->nth <= 1) {
+        // All workers must finish the shared decision before the ordinary matmul
+        // reuses this work buffer for its own counters and converted inputs.
+        ggml_barrier(params->threadpool);
+        return false;
+    }
+    if (params->ith == 0) {
+        atomic_fetch_add_explicit(&g_expert_ffn_fusion_count, 1, memory_order_relaxed);
+    }
+    for (int row = params->ith; row < n_routes; row += params->nth) {
+        if (routes[row] < 0) {
+            memset((char *) down->data + (row/ids->ne[0])*down->nb[2] +
+                   (row%ids->ne[0])*down->nb[1], 0, down->ne[0]*sizeof(float));
+        }
+    }
+
+    float * gate_values = (float *) (threads + params->ith*thread_size);
+    float * up_values = gate_values + n_routes*n_ff;
+    void * down_input = (char *) gate_values + GGML_PAD((n_routes + 1)*n_ff*sizeof(float), 64);
+    for (;;) {
+        const int index = atomic_fetch_add_explicit(&shared->next, 1, memory_order_relaxed);
+        if (index >= shared->active_count) {
+            break;
+        }
+        const int expert = active[index];
+        const struct ggml_tensor * weights[] = { gate_w, up_w };
+        for (int p = 0; p < 2; ++p) {
+            const struct ggml_tensor * w = weights[p];
+            if (g_expert_ready_hook) {
+                g_expert_ready_hook(w, expert, g_expert_ready_hook_data);
+            }
+            for (int row = 0; row < n_routes; ++row) {
+                if (routes[row] != expert) {
+                    continue;
+                }
+                const int64_t input_row = (row/ids->ne[0])*input->ne[1] + (row%ids->ne[0])%input->ne[1];
+                float * result = p == 0 ? gate_values + row*n_ff : up_values;
+                for (int out = 0; out < n_ff; ++out) {
+                    type_traits_cpu[w->type].vec_dot(input->ne[0], &result[out], 0,
+                        (const char *) w->data + expert*w->nb[2] + out*w->nb[1], 0,
+                        inputs + input_row*input_row_size, 0, 1);
+                }
+                if (p == 1) {
+                    ggml_vec_swiglu_f32(n_ff, gate_values + row*n_ff, gate_values + row*n_ff, up_values);
+                }
+            }
+        }
+        if (g_expert_ready_hook) {
+            g_expert_ready_hook(down_w, expert, g_expert_ready_hook_data);
+        }
+        for (int row = 0; row < n_routes; ++row) {
+            if (routes[row] != expert) {
+                continue;
+            }
+            type_traits_cpu[down_qtype].from_float(gate_values + row*n_ff, down_input, n_ff);
+            float * result = (float *) ((char *) down->data + (row/ids->ne[0])*down->nb[2] +
+                                       (row%ids->ne[0])*down->nb[1]);
+            for (int out = 0; out < down->ne[0]; ++out) {
+                type_traits_cpu[down_w->type].vec_dot(n_ff, &result[out], 0,
+                    (const char *) down_w->data + expert*down_w->nb[2] + out*down_w->nb[1], 0,
+                    down_input, 0, 1);
+            }
+        }
+    }
+    return true;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1601,6 +1822,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+
+    int64_t * active_experts = incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
+    int64_t * active_count = incr_ptr_aligned(&wdata_cur, sizeof(int64_t), sizeof(int64_t));
+    atomic_int * active_next = incr_ptr_aligned(&wdata_cur, sizeof(atomic_int), sizeof(atomic_int));
 
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
@@ -1651,6 +1876,8 @@ static void ggml_compute_forward_mul_mat_id(
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        *active_count = 0;
+        atomic_store_explicit(active_next, 0, memory_order_relaxed);
 
         // An opt-in host expert->GPU-slot table makes a routed GPU hit contribute
         // only through the device branch. The zeroed CPU row still participates
@@ -1676,6 +1903,7 @@ static void ggml_compute_forward_mul_mat_id(
                     continue;
                 }
 
+                if (matrix_row_counts[i02] == 0) active_experts[(*active_count)++] = i02;
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
@@ -1689,6 +1917,22 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     ggml_barrier(params->threadpool);
+
+    // Streamed decode can work on independent ready experts while another worker waits for I/O.
+    if (g_expert_ready_hook && ids->ne[1] <= 16 && *active_count >= nth && nth > 1) {
+        const void * wdata = src1->type == vec_dot_type ? src1->data : params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        for (;;) {
+            const int next = atomic_fetch_add_explicit(active_next, 1, memory_order_relaxed);
+            if (next >= *active_count) break;
+            const int64_t cur_a = active_experts[next];
+            g_expert_ready_hook(src0, cur_a, g_expert_ready_hook_data);
+            ggml_compute_forward_mul_mat_id_one_chunk(
+                dst, src0, src1, ids, cur_a, 0, ne01, 0, matrix_row_counts[cur_a],
+                (const char *) src0->data + cur_a*nb02, matrix_rows, row_size, src1_cont, wdata);
+        }
+        return;
+    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -2935,6 +3179,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
+                        // active expert work queue
+                        cur += n_as*sizeof(int64_t) + 2*sizeof(int64_t) + sizeof(atomic_int);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
                         // Workspace for tiled (see tiled.h)
@@ -3073,6 +3319,9 @@ struct ggml_cplan ggml_graph_plan(
             }
         }
 
+        if (ggml_cpu_expert_ffn_candidate(cgraph, i)) {
+            cur = MAX(cur, ggml_cpu_expert_ffn_work_size(cgraph, i, n_threads));
+        }
         work_size = MAX(work_size, cur);
     }
 
@@ -3104,6 +3353,11 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (ggml_cpu_expert_ffn_candidate(cgraph, node_n) &&
+        ggml_compute_forward_expert_ffn_fused(params, cgraph->nodes[node_n + 2], cgraph->nodes[node_n + 3])) {
+        return 3;
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion

@@ -662,7 +662,16 @@ void llama_context::sched_reserve() {
     if (!compute_share_source) {
         previous_sched.reset();
     }
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    auto create_sched = [&]() {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        bool overlap = false;
+        for (size_t i = 0; cparams.expert_cache_layers && i < cparams.expert_cache_layer_count; ++i) {
+            const auto & layer = cparams.expert_cache_layers[i];
+            overlap = overlap || (layer.overlap_cpu && !layer.state);
+        }
+        ggml_backend_sched_set_branch_overlap(sched.get(), overlap);
+    };
+    create_sched();
 
     if (source) {
         int n_devices = 0;
@@ -721,7 +730,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                create_sched();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1320,6 +1329,11 @@ void llama_context::set_warmup(bool value) {
 void llama_context::set_expert_cache_layers(const llama_expert_cache_layer * layers, size_t count) {
     cparams.expert_cache_layers = layers;
     cparams.expert_cache_layer_count = count;
+    bool overlap = false;
+    for (size_t i = 0; layers && i < count; ++i) {
+        overlap = overlap || (layers[i].overlap_cpu && !layers[i].state);
+    }
+    ggml_backend_sched_set_branch_overlap(sched.get(), overlap);
     sched_need_reserve = true;
 }
 

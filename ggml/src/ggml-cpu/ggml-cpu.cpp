@@ -478,6 +478,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_LRU_DECIDE:
+        case GGML_OP_LRU_STAGE:
+        case GGML_OP_LRU_FILL:
+            return false;
         default:
             return true;
     }

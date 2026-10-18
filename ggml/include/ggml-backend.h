@@ -319,6 +319,10 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Allow independent device/host branches to overlap. Observation callbacks and
+    // transfers retain their barriers; shared-buffer backends retain serial execution.
+    GGML_API void ggml_backend_sched_set_branch_overlap(ggml_backend_sched_t sched, bool enabled);
+
     // Share physical compute buffers while keeping scheduler and graph allocation state independent.
     // Both schedulers must execute serially. Incompatible layouts and buffers with reset callbacks are rejected.
     GGML_API bool ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src);

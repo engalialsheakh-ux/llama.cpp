@@ -1318,6 +1318,19 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     return &ggml_backend_cuda_buffer_type_host;
 }
 
+static ggml_backend_buffer_t ggml_backend_cuda_alloc_mapped_host_buffer(size_t size) {
+    void * host = nullptr;
+    const cudaError_t err = cudaHostAlloc(&host, size, cudaHostAllocPortable | cudaHostAllocMapped);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(host, size);
+    buffer->buft = ggml_backend_cuda_host_buffer_type();
+    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    return buffer;
+}
+
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
@@ -1329,6 +1342,62 @@ typedef void (*ggml_cuda_op_mul_mat_t)(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// A single thread owns the mutation so replaying a CUDA graph preserves the
+// same ownership and LRU order for the same sequence of router IDs.
+static __global__ void k_lru_decide(
+        const int32_t * ids, int32_t * slot_ids, int32_t * state, int32_t * fills,
+        int n_used, int n_tokens, int n_expert, int n_slot, int ids_stride) {
+    int32_t * owner = state;
+    int32_t * slot_of = state + n_expert;
+    int32_t * last_use = slot_of + n_slot;
+    const int32_t tick = state[n_expert + 2*n_slot];
+    const int count = n_used*n_tokens;
+    int n_fill = 0;
+
+    for (int i = 0; i < count; ++i) {
+        const int e = ids[(i/n_used)*ids_stride + i%n_used];
+        const int s = e >= 0 && e < n_expert ? owner[e] : -1;
+        slot_ids[i] = s;
+        if (s >= 0) last_use[s] = tick;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (slot_ids[i] >= 0) continue;
+        const int e = ids[(i/n_used)*ids_stride + i%n_used];
+        if (e < 0 || e >= n_expert) continue;
+        if (owner[e] >= 0) {
+            slot_ids[i] = owner[e];
+            continue;
+        }
+        int best = 1;
+        for (int s = 2; s < n_slot; ++s)
+            if (last_use[s] < last_use[best]) best = s;
+        const int previous = slot_of[best];
+        if (previous >= 0) owner[previous] = -1;
+        slot_of[best] = e;
+        owner[e] = best;
+        last_use[best] = tick;
+        slot_ids[i] = best;
+        fills[2*n_fill] = e;
+        fills[2*n_fill + 1] = best;
+        ++n_fill;
+    }
+    state[n_expert + 2*n_slot] = tick + 1;
+    state[n_expert + 2*n_slot + 1] += count;
+    state[n_expert + 2*n_slot + 2] += n_fill;
+    fills[2*n_slot] = n_fill;
+}
+
+static __global__ void k_lru_fill(
+        const int32_t * fills, int n_slot, const char * src, char * pool,
+        size_t source_stride, size_t pool_stride, size_t bytes) {
+    const int fill = blockIdx.y;
+    if (fill >= fills[2*n_slot]) return;
+    const char * from = src + size_t(fill)*source_stride;
+    char * to = pool + size_t(fills[2*fill + 1])*pool_stride;
+    for (size_t i = blockIdx.x*blockDim.x + threadIdx.x; i < bytes; i += gridDim.x*blockDim.x)
+        to[i] = from[i];
+}
 
 static __global__ void k_compute_batched_ptrs(
         const void * src0_as_f16, const void * src1_as_f16, char * dst,
@@ -1902,6 +1971,48 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * ids = dst->src[0];
+    ggml_tensor * state = dst->src[1];
+    const int n_expert = ggml_get_op_params_i32(dst, 0);
+    const int n_slot = ggml_get_op_params_i32(dst, 1);
+    const int n_used = int(ids->ne[0]);
+    const int n_tokens = int(ids->ne[1]);
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
+    int32_t * fills = (int32_t *) dst->data + n_used*n_tokens;
+    k_lru_decide<<<1, 1, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, (int32_t *) dst->data, (int32_t *) state->data, fills,
+        n_used, n_tokens, n_expert, n_slot, int(ids->nb[1]/sizeof(int32_t)));
+}
+
+static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * fills = dst->src[0];
+    ggml_tensor * pool = dst->src[1];
+    ggml_tensor * src = nullptr;
+    memcpy(&src, dst->op_params, sizeof(src));
+    const int n_slot = int((fills->ne[0] - 1)/2);
+    const size_t bytes = ggml_row_size(pool->type, pool->ne[0])*size_t(pool->ne[1]);
+    GGML_ASSERT(src && src->nb[2] >= bytes && pool->nb[2] >= bytes);
+    k_lru_fill<<<dim3(64, n_slot), 256, 0, ctx.stream()>>>(
+        (const int32_t *) fills->data, n_slot, (const char *) src->data, (char *) pool->data,
+        src->nb[2], pool->nb[2], bytes);
+}
+
+static void CUDART_CB ggml_cuda_lru_stage_host(void * user_data) {
+    ggml_lru_stage_params params;
+    memcpy(&params, user_data, sizeof(params));
+    params.callback(params.user_data);
+}
+
+static void ggml_cuda_lru_stage(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_lru_stage_params params;
+    memcpy(&params, dst->op_params, sizeof(params));
+    const ggml_tensor * fills = dst->src[0];
+    CUDA_CHECK(cudaMemcpyAsync(params.host_fill_list, fills->data, ggml_nbytes(fills),
+                               cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaLaunchHostFunc(ctx.stream(), ggml_cuda_lru_stage_host, dst->op_params));
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2186,6 +2297,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     return false;
             }
             break;
+        case GGML_OP_LRU_DECIDE:
+            ggml_cuda_lru_decide(ctx, dst);
+            break;
+        case GGML_OP_LRU_STAGE:
+            ggml_cuda_lru_stage(ctx, dst);
+            break;
+        case GGML_OP_LRU_FILL:
+            ggml_cuda_lru_fill(ctx, dst);
+            break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(dst)) {
                 case GGML_GLU_OP_REGLU:
@@ -2436,7 +2556,12 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
-
+#ifdef USE_CUDA_GRAPH
+    GGML_LOG_INFO("bmoe-cuda-graphs: captures=%llu replays=%llu invalidations=%llu fallbacks=%llu live_variants=%zu\n",
+                  (unsigned long long) cuda_ctx->graph_captures, (unsigned long long) cuda_ctx->graph_replays,
+                  (unsigned long long) cuda_ctx->graph_invalidations, (unsigned long long) cuda_ctx->graph_fallbacks,
+                  cuda_ctx->cuda_graphs.size());
+#endif
     delete cuda_ctx;
     delete backend;
 }
@@ -4469,6 +4594,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    ++cuda_ctx->graph_invalidations;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
@@ -4476,10 +4602,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+        if (!use_cuda_graph) ++cuda_ctx->graph_fallbacks;
     }
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
+        size_t free_bytes = 0, total_bytes = 0;
+        // Captures own CUDA allocations. Leave the host's 128 MiB expert-pool safety rail plus
+        // 64 MiB of capture headroom; direct execution remains available below that threshold.
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes < 192ull * 1024 * 1024) {
+            use_cuda_graph = false;
+            ++cuda_ctx->graph_fallbacks;
+        }
+    }
+    if (use_cuda_graph && cuda_graph_update_required) {
+        ++cuda_ctx->graph_captures;
         // Start CUDA graph capture
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4489,6 +4626,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    if (use_cuda_graph && !cuda_graph_update_required) ++cuda_ctx->graph_replays;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     return GGML_STATUS_SUCCESS;
@@ -4966,6 +5104,19 @@ struct ggml_backend_cuda_device_context {
     int op_offload_min_batch_size;
 };
 
+static void * ggml_backend_cuda_mapped_host_pointer(ggml_backend_dev_t dev, void * host) {
+    if (!dev || !host) return nullptr;
+    auto * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    ggml_cuda_set_device(ctx->device);
+    void * mapped = nullptr;
+    const cudaError_t err = cudaHostGetDevicePointer(&mapped, host, 0);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return mapped;
+}
+
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ctx->name.c_str();
@@ -5191,6 +5342,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_LRU_DECIDE:
+        case GGML_OP_LRU_STAGE:
+        case GGML_OP_LRU_FILL:
+            return true;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU:
@@ -5778,6 +5933,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mapped_host_pointer") == 0) {
+        return (void *)ggml_backend_cuda_mapped_host_pointer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_alloc_mapped_host_buffer") == 0) {
+        return (void *)ggml_backend_cuda_alloc_mapped_host_buffer;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

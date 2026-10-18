@@ -2168,29 +2168,66 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // The external cache branch is opt-in and currently covers exact single-token
-    // split gate/up/down with SiLU. Prefill and every unsupported graph keep the
-    // original expert path.
+    // The external cache branch covers exact split gate/up/down with SiLU.
+    // Callers attach it only to decode/verify batches, never prefill.
     const llama_expert_cache_layer * expert_cache = nullptr;
     ggml_tensor * cache_ids = nullptr;
-    if (n_tokens == 1 && il >= 0 && cparams.expert_cache_layers &&
+    if (n_tokens <= 16 && il >= 0 && cparams.expert_cache_layers &&
         size_t(il) < cparams.expert_cache_layer_count && gate_exps && up_exps && down_exps && !gate_up_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
         type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
         expert_cache = &cparams.expert_cache_layers[il];
-        if (!expert_cache->up || !expert_cache->gate || !expert_cache->down ||
-            !expert_cache->host_table || !expert_cache->device_table) {
+        const bool external = expert_cache->state && expert_cache->host_gate && expert_cache->host_up &&
+                              expert_cache->host_down && expert_cache->host_fill_list &&
+                              expert_cache->stage_callback && expert_cache->n_expert > 0 &&
+                              expert_cache->n_slots - 1 >= n_expert_used*n_tokens;
+        const bool mapped = expert_cache->host_table && expert_cache->device_table;
+        if (!expert_cache->up || !expert_cache->gate || !expert_cache->down || (!external && !mapped)) {
             expert_cache = nullptr;
         }
     }
+    const bool gpu_owned_cache = expert_cache && expert_cache->state && expert_cache->host_gate &&
+                                 expert_cache->host_up && expert_cache->host_down &&
+                                 expert_cache->host_fill_list && expert_cache->stage_callback &&
+                                 expert_cache->n_slots - 1 >= n_expert_used*n_tokens;
+    ggml_tensor * cache_gate = expert_cache ? expert_cache->gate : nullptr;
+    ggml_tensor * cache_up = expert_cache ? expert_cache->up : nullptr;
+    ggml_tensor * cache_down = expert_cache ? expert_cache->down : nullptr;
     if (expert_cache) {
-        cache_ids = ggml_get_rows(ctx0, expert_cache->device_table, selected_experts);
-        cache_ids = ggml_reshape_2d(ctx0, cache_ids, n_expert_used, 1);
+        if (gpu_owned_cache) {
+            ggml_tensor * decision = ggml_lru_decide(ctx0, selected_experts, expert_cache->state,
+                                                      expert_cache->n_expert, expert_cache->n_slots);
+            cache_ids = ggml_view_2d(ctx0, decision, n_expert_used, n_tokens,
+                                     size_t(n_expert_used)*sizeof(int32_t), 0);
+            ggml_tensor * fills = ggml_view_1d(ctx0, decision, 2*expert_cache->n_slots + 1,
+                                               size_t(n_expert_used*n_tokens)*sizeof(int32_t));
+            fills = ggml_lru_stage(ctx0, fills, expert_cache->host_fill_list,
+                                   expert_cache->stage_callback, expert_cache->stage_user_data);
+            cache_gate = ggml_lru_fill(ctx0, fills, expert_cache->host_gate, cache_gate);
+            cache_up = ggml_lru_fill(ctx0, fills, expert_cache->host_up, cache_up);
+            cache_down = ggml_lru_fill(ctx0, fills, expert_cache->host_down, cache_down);
+        } else {
+            ggml_tensor * table = expert_cache->device_table;
+            ggml_tensor * device_table = ggml_view_3d(ctx0, table, 1, table->ne[1], n_tokens,
+                                                       table->nb[1], table->nb[2], 0);
+            cache_ids = ggml_get_rows(ctx0, device_table, selected_experts);
+            cache_ids = ggml_reshape_2d(ctx0, cache_ids, n_expert_used, n_tokens);
+        }
         cb(cache_ids, "ffn_moe_cache_slots", il);
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     ggml_tensor * cache_input = cur;
+    if (expert_cache && expert_cache->overlap_cpu && !gpu_owned_cache) {
+        // Copy the shared prerequisites before device expert work is queued. A
+        // later implicit D2H copy would wait for that entire branch and serialize it.
+        cur = ggml_dup(ctx0, cur);
+        selected_experts = ggml_dup(ctx0, selected_experts);
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, selected_experts, backend_cpu);
+        ggml_build_forward_expand(gf, cur);
+        ggml_build_forward_expand(gf, selected_experts);
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2357,8 +2394,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(experts, "ffn_moe_down", il);
 
     if (expert_cache) {
-        ggml_tensor * up_gpu = ggml_mul_mat_id(ctx0, expert_cache->up, cache_input, cache_ids);
-        ggml_tensor * gate_gpu = ggml_mul_mat_id(ctx0, expert_cache->gate, cache_input, cache_ids);
+        ggml_tensor * up_gpu = ggml_mul_mat_id(ctx0, cache_up, cache_input, cache_ids);
+        ggml_tensor * gate_gpu = ggml_mul_mat_id(ctx0, cache_gate, cache_input, cache_ids);
         ggml_tensor * activated_gpu = nullptr;
         const float limit = hparams.swiglu_clamp_exp[il];
         if (limit > 1e-6f) {
@@ -2369,8 +2406,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         } else {
             activated_gpu = ggml_swiglu_split(ctx0, gate_gpu, up_gpu);
         }
-        ggml_tensor * down_gpu = ggml_mul_mat_id(ctx0, expert_cache->down, activated_gpu, cache_ids);
-        experts = ggml_add(ctx0, experts, down_gpu);
+        ggml_tensor * down_gpu = ggml_mul_mat_id(ctx0, cache_down, activated_gpu, cache_ids);
+        if (expert_cache->overlap_cpu && !gpu_owned_cache) {
+            // Keep the add's operand order unchanged; only independent branch
+            // scheduling changes. The host copies stay live through their consumers.
+            ggml_build_forward_expand(gf, down_gpu);
+        }
+        experts = gpu_owned_cache ? down_gpu : ggml_add(ctx0, experts, down_gpu);
         cb(experts, "ffn_moe_cache_merged", il);
     }
 

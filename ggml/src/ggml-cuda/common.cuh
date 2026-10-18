@@ -1459,6 +1459,10 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    uint64_t graph_captures = 0;
+    uint64_t graph_replays = 0;
+    uint64_t graph_invalidations = 0;
+    uint64_t graph_fallbacks = 0;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1479,6 +1483,14 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
+            // Bound live variants even when speculative widths create many short-lived graph keys.
+            if (cuda_graphs.size() >= 64) {
+                auto oldest = std::min_element(cuda_graphs.begin(), cuda_graphs.end(),
+                    [](const auto & a, const auto & b) {
+                        return a.second->last_used_time < b.second->last_used_time;
+                    });
+                cuda_graphs.erase(oldest);
+            }
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;

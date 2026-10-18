@@ -830,6 +830,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool branch_overlap;
 
     int debug;
 
@@ -1643,6 +1644,55 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static bool ggml_backend_sched_split_private_buffers(
+        ggml_backend_sched_t sched, const ggml_backend_sched_split * split, int other_backend_id) {
+    // Distinct allocator domains alone are insufficient: a preallocated tensor can
+    // be accessible to both backends. Check actual buffers, including view bases.
+    auto is_private = [&](const ggml_tensor * tensor) {
+        while (tensor->view_src) {
+            tensor = tensor->view_src;
+        }
+        return tensor->buffer &&
+            ggml_backend_supports_buft(sched->backends[split->backend_id], tensor->buffer->buft) &&
+            !ggml_backend_supports_buft(sched->backends[other_backend_id], tensor->buffer->buft);
+    };
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const ggml_tensor * node = split->graph.nodes[i];
+        if (ggml_is_view_op(node->op) || ggml_is_empty(node)) {
+            continue;
+        }
+        if (!is_private(node)) {
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] && !is_private(node->src[j])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_splits_independent(
+        ggml_backend_sched_t sched, const ggml_backend_sched_split * previous,
+        const ggml_backend_sched_split * current) {
+    // Limit this to a device branch followed by synchronous host work. Existing
+    // transfer barriers cover the join. No shared allocator or direct buffer access
+    // can let the CPU overwrite storage still in use by the queued device branch.
+    if (!sched->branch_overlap || current->n_inputs != 0 || previous->n_inputs != 0 ||
+        sched->n_backends != 2 ||
+        sched->bufts[previous->backend_id] == sched->bufts[current->backend_id] ||
+        ggml_backend_dev_type(ggml_backend_get_device(sched->backends[previous->backend_id])) !=
+            GGML_BACKEND_DEVICE_TYPE_GPU ||
+        ggml_backend_dev_type(ggml_backend_get_device(sched->backends[current->backend_id])) !=
+            GGML_BACKEND_DEVICE_TYPE_CPU ||
+        sched->backends[current->backend_id]->iface.synchronize != nullptr) {
+        return false;
+    }
+    return ggml_backend_sched_split_private_buffers(sched, previous, current->backend_id) &&
+           ggml_backend_sched_split_private_buffers(sched, current, previous->backend_id);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1657,10 +1707,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const bool overlap_next = split_id + 1 < sched->n_splits &&
+            ggml_backend_sched_splits_independent(sched, split, &splits[split_id + 1]);
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
+            !ggml_backend_sched_splits_independent(sched, &splits[split_id - 1], split)) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -1798,6 +1851,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                if (sched->branch_overlap) {
+                    ggml_backend_sched_synchronize(sched);
+                }
                 return ec;
             }
         } else {
@@ -1820,11 +1876,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    if (sched->branch_overlap) {
+                        ggml_backend_sched_synchronize(sched);
+                    }
                     return ec;
                 }
 
-                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                // Only an unobserved, independently allocated device branch may
+                // remain queued while the following synchronous host branch runs.
+                if (need || !overlap_next) {
+                    ggml_backend_synchronize(split_backend);
+                }
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -2061,6 +2123,11 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_branch_overlap(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->branch_overlap = enabled;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

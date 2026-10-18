@@ -1129,6 +1129,19 @@ extern "C" {
         struct ggml_tensor * host_table;
         struct ggml_tensor * device_table;
         int32_t dummy_slot;
+        // Optional device-owned LRU path. Host weights must be device-addressable;
+        // the cache state and all three pool weights remain caller-owned.
+        struct ggml_tensor * state;
+        struct ggml_tensor * host_gate;
+        struct ggml_tensor * host_up;
+        struct ggml_tensor * host_down;
+        int32_t n_expert;
+        int32_t n_slots;
+        int32_t * host_fill_list;
+        void (*stage_callback)(void * user_data);
+        void * stage_user_data;
+        // Materialize host inputs before launching the independent mapped-cache branch.
+        bool overlap_cpu;
     };
 
     LLAMA_API void llama_set_expert_cache_layers(struct llama_context * ctx,

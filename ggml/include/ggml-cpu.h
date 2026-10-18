@@ -151,6 +151,12 @@ extern "C" {
     // respect to concurrent graph computation - register before compute starts.
     GGML_BACKEND_API void ggml_cpu_set_expert_ready_hook(ggml_cpu_expert_ready_hook_t hook, void * user_data);
 
+    // Opt-in expert-local MUL_MAT_ID + SwiGLU + MUL_MAT_ID execution. Configure
+    // before graph planning/computation; like the ready hook this is process-global.
+    // Setting the option resets its diagnostic count. Disabled by default.
+    GGML_BACKEND_API void    ggml_cpu_set_expert_ffn_fusion(bool enabled);
+    GGML_BACKEND_API int64_t ggml_cpu_expert_ffn_fusion_count(void);
+
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);
